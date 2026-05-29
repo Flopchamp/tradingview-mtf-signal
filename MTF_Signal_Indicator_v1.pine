@@ -1,0 +1,573 @@
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║  MTF SIGNAL INDICATOR v1.0                                           ║
+// ║  Multi-Timeframe Options Signal Confirmation — 1-Minute Chart        ║
+// ║                                                                      ║
+// ║  REPAINTING DISCLOSURE (read before using in backtest):              ║
+// ║  • HTF trend (5m/15m/D via request.security): Repaints within the   ║
+// ║    current higher-TF bar. Historical bars are stable after close.    ║
+// ║  • ORB levels: Repaint during formation (first 5 or 15 candles).    ║
+// ║    This is expected — levels are incomplete until the window closes. ║
+// ║  • Pivot zones: Stable on closed historical bars. The zone           ║
+// ║    contribution from the current trading day may shift until         ║
+// ║    the daily bar closes at 4 PM.                                     ║
+// ║  • All signals fire on confirmed 1m bar CLOSE — no intra-bar paint. ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+//@version=5
+indicator("MTF Signal Indicator [v1.0]",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 200,
+     max_bars_back    = 5000)
+
+// ══════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════
+
+// ── EMAs ────────────────────────────────────────────
+i_emaFast       = input.int   (9,    "EMA Fast Length",                   minval=1,   maxval=50,  group="EMAs")
+i_emaSlow       = input.int   (20,   "EMA Slow Length",                   minval=1,   maxval=200, group="EMAs")
+
+// ── Opening Range ────────────────────────────────────
+i_orbEnabled    = input.bool  (true, "Require ORB Break for Signal",                              group="Opening Range")
+
+// ── Pivot Zones ──────────────────────────────────────
+i_pvtLookback   = input.int   (90,   "Lookback (trading days)",           minval=10,  maxval=252, group="Pivot Zones")
+i_pvtMinTouches = input.int   (3,    "Minimum Touches for Zone",          minval=2,   maxval=10,  group="Pivot Zones")
+i_zoneTol       = input.float (0.5,  "Zone Cluster Tolerance (%)",        minval=0.1, maxval=3.0, step=0.05, group="Pivot Zones")
+
+// ── Signals ──────────────────────────────────────────
+i_zoneProx      = input.float (0.3,  "A-Grade Zone Proximity (%)",        minval=0.05, maxval=2.0, step=0.05, group="Signals")
+// T1 = underlying price move target. Default 0.5% based on options delta math (see notes).
+i_t1Pct         = input.float (0.5,  "T1 Target (% underlying move)",     minval=0.1, maxval=10.0, step=0.05, group="Signals")
+
+// ── Pre-Market ───────────────────────────────────────
+i_pmOverride    = input.symbol("",   "Pre-market Source Override\n(blank = current symbol | SPX users: try ES1!)", group="Key Levels")
+
+// ── Display Toggles ──────────────────────────────────
+i_showORB       = input.bool  (true, "Show ORB Lines",                    group="Display Toggles")
+i_showPrevDay   = input.bool  (true, "Show Previous Day Levels",          group="Display Toggles")
+i_showPreMkt    = input.bool  (true, "Show Pre-Market Levels",            group="Display Toggles")
+i_showZones     = input.bool  (true, "Show Pivot Zones",                  group="Display Toggles")
+i_showTable     = input.bool  (true, "Show Trend Table",                  group="Display Toggles")
+i_showExits     = input.bool  (true, "Show Exit Guidance (T1 + Warning)", group="Display Toggles")
+
+// ── Session Filter ───────────────────────────────────
+i_sessFilter    = input.bool  (true,        "Limit Signals to Session Window", group="Session")
+i_sessTime      = input.session("0930-1100","Signal Window (exchange timezone)", group="Session")
+
+// ══════════════════════════════════════════════════════
+// TIME / SESSION HELPERS
+// ══════════════════════════════════════════════════════
+
+TZ          = "America/New_York"
+isRTH       = not na(time("1", "0930-1600", TZ))
+isPreMktBar = not na(time("1", "0400-0930", TZ))
+isORB5win   = not na(time("1", "0930-0935", TZ))   // 5-min ORB window (9:30–9:35)
+isORB15win  = not na(time("1", "0930-0945", TZ))   // 15-min ORB window (9:30–9:45)
+inSigSess   = i_sessFilter ? not na(time("1", i_sessTime, TZ)) : isRTH
+
+newDay      = ta.change(time("D")) != 0   // True on first 1m bar of each new trading day
+
+// ══════════════════════════════════════════════════════
+// SECTION 3 — EMA + VWAP
+// ══════════════════════════════════════════════════════
+
+ema9    = ta.ema(close, i_emaFast)
+ema20   = ta.ema(close, i_emaSlow)
+vwapVal = ta.vwap(hlc3)   // Built-in session-anchored VWAP; resets at 9:30 AM automatically
+
+plot(ema9,    "EMA Fast", color=color.new(color.lime,   0), linewidth=1)
+plot(ema20,   "EMA Slow", color=color.new(color.orange, 0), linewidth=1)
+plot(vwapVal, "VWAP",     color=color.new(color.purple, 0), linewidth=2)
+
+// ══════════════════════════════════════════════════════
+// SECTION 1a — PREVIOUS DAY HIGH / LOW
+// ══════════════════════════════════════════════════════
+
+// [1] requests the prior CLOSED daily bar — lookahead_on is correct here (no future leak)
+pdHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+// ══════════════════════════════════════════════════════
+// SECTION 1b — PRE-MARKET HIGH / LOW
+// ══════════════════════════════════════════════════════
+// Tracks the highest high and lowest low during the pre-market session (4:00–9:30 AM).
+// Extended hours must be enabled in TradingView chart settings for this to populate.
+// For SPX (cash index, no pre-market): lines will not appear — this is expected.
+// SPX users: enter "ES1!" in the Pre-market Source Override input.
+
+f_pmHL() =>
+    var float _h    = na
+    var float _l    = na
+    var int   _date = na
+    _ispm = not na(time("1", "0400-0930", TZ))
+    _d    = dayofmonth(time, TZ)
+    // Reset at start of new calendar day
+    if na(_date) or _d != _date
+        _date := _d
+        _h    := na
+        _l    := na
+    if _ispm
+        _h := na(_h) ? high : math.max(_h, high)
+        _l := na(_l) ? low  : math.min(_l, low)
+    [_h, _l]
+
+_pmSym         = i_pmOverride != "" ? i_pmOverride : syminfo.tickerid
+[pmHigh, pmLow] = request.security(_pmSym, "1", f_pmHL(),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// ══════════════════════════════════════════════════════
+// SECTION 1c — OPENING RANGE (ORB)
+// ══════════════════════════════════════════════════════
+
+var float orb5H  = na
+var float orb5L  = na
+var float orb15H = na
+var float orb15L = na
+var bool  orb5Done  = false   // True once the 5-min formation window has closed
+var bool  orb15Done = false
+
+// ORB break state — tracks whether price is above/below ORB in current run
+// Resets when price closes back through the ORB level
+var bool orb5AbvActive  = false   // Price currently above 5m ORB (break active)
+var bool orb5BlwActive  = false   // Price currently below 5m ORB (break active)
+var bool orb15AbvActive = false
+var bool orb15BlwActive = false
+
+// Signal consumed state — prevents repeat fires on same ORB break cycle
+var bool callConsumed = false
+var bool putConsumed  = false
+
+if newDay
+    orb5H  := na
+    orb5L  := na
+    orb15H := na
+    orb15L := na
+    orb5Done       := false
+    orb15Done      := false
+    orb5AbvActive  := false
+    orb5BlwActive  := false
+    orb15AbvActive := false
+    orb15BlwActive := false
+    callConsumed   := false
+    putConsumed    := false
+
+// Build ORB levels bar by bar during formation windows
+if isORB5win
+    orb5H := na(orb5H) ? high : math.max(orb5H, high)
+    orb5L := na(orb5L) ? low  : math.min(orb5L, low)
+
+if isORB15win
+    orb15H := na(orb15H) ? high : math.max(orb15H, high)
+    orb15L := na(orb15L) ? low  : math.min(orb15L, low)
+
+// Lock ORB when formation windows end
+if not isORB5win  and not orb5Done  and not na(orb5H)
+    orb5Done := true
+if not isORB15win and not orb15Done and not na(orb15H)
+    orb15Done := true
+
+// Update ORB break states — active while price holds above/below, reset on reversion
+if orb5Done and not na(orb5H)
+    if close > orb5H
+        orb5AbvActive := true
+    if close <= orb5H                     // Closed back below — reset so re-break can fire
+        orb5AbvActive := false
+        callConsumed  := false
+    if close < orb5L
+        orb5BlwActive := true
+    if close >= orb5L
+        orb5BlwActive := false
+        putConsumed   := false
+
+if orb15Done and not na(orb15H)
+    if close > orb15H
+        orb15AbvActive := true
+    if close <= orb15H
+        orb15AbvActive := false
+        callConsumed   := false
+    if close < orb15L
+        orb15BlwActive := true
+    if close >= orb15L
+        orb15BlwActive := false
+        putConsumed    := false
+
+// Combined ORB condition
+orbBullMet = not i_orbEnabled or (orb5AbvActive or orb15AbvActive)
+orbBearMet = not i_orbEnabled or (orb5BlwActive or orb15BlwActive)
+
+// ══════════════════════════════════════════════════════
+// KEY LEVEL LINE + LABEL DRAWING
+// ══════════════════════════════════════════════════════
+// Lines use extend.right. Labels track bar_index each bar to stay at chart right edge.
+
+var line  lnPDH  = na, lnPDL  = na
+var line  lnPMH  = na, lnPML  = na
+var line  lnO5H  = na, lnO5L  = na
+var line  lnO15H = na, lnO15L = na
+
+var label lblPDH  = na, lblPDL  = na
+var label lblPMH  = na, lblPML  = na
+var label lblO5H  = na, lblO5L  = na
+var label lblO15H = na, lblO15L = na
+
+_mkLine(float lvl, color col) =>
+    line.new(bar_index, lvl, bar_index + 1, lvl,
+         extend=extend.right, color=col, style=line.style_dashed, width=1)
+
+_mkLabel(float lvl, string txt, color col) =>
+    label.new(bar_index + 4, lvl, txt,
+         style=label.style_none, textcolor=col, size=size.tiny,
+         color=color.new(color.white, 100))
+
+// Redraw previous-day and pre-market lines at the start of each RTH session
+if newDay and isRTH
+    line.delete(lnPDH),   line.delete(lnPDL)
+    line.delete(lnPMH),   line.delete(lnPML)
+    label.delete(lblPDH), label.delete(lblPDL)
+    label.delete(lblPMH), label.delete(lblPML)
+    lnPDH  := na,  lnPDL  := na
+    lnPMH  := na,  lnPML  := na
+    lblPDH := na,  lblPDL := na
+    lblPMH := na,  lblPML := na
+
+    _cPD = color.new(color.gray, 30)
+    _cPM = color.new(#4FC3F7,   30)   // soft blue for pre-market
+
+    if i_showPrevDay and not na(pdHigh)
+        lnPDH  := _mkLine (pdHigh, _cPD)
+        lnPDL  := _mkLine (pdLow,  _cPD)
+        lblPDH := _mkLabel(pdHigh, "PDH", _cPD)
+        lblPDL := _mkLabel(pdLow,  "PDL", _cPD)
+
+    if i_showPreMkt and not na(pmHigh)
+        lnPMH  := _mkLine (pmHigh, _cPM)
+        lnPML  := _mkLine (pmLow,  _cPM)
+        lblPMH := _mkLabel(pmHigh, "PMH", _cPM)
+        lblPML := _mkLabel(pmLow,  "PML", _cPM)
+
+// Draw ORB lines once formation window ends (not before)
+_cO5  = color.new(color.orange, 25)
+_cO15 = color.new(#FFD700,      25)
+
+if i_showORB
+    if orb5Done and na(lnO5H)
+        lnO5H  := _mkLine (orb5H, _cO5)
+        lnO5L  := _mkLine (orb5L, _cO5)
+        lblO5H := _mkLabel(orb5H, "ORB5 H", _cO5)
+        lblO5L := _mkLabel(orb5L, "ORB5 L", _cO5)
+
+    if orb15Done and na(lnO15H)
+        lnO15H  := _mkLine (orb15H, _cO15)
+        lnO15L  := _mkLine (orb15L, _cO15)
+        lblO15H := _mkLabel(orb15H, "ORB15 H", _cO15)
+        lblO15L := _mkLabel(orb15L, "ORB15 L", _cO15)
+
+    // Keep ORB labels at right edge
+    if not na(lblO5H)
+        label.set_x(lblO5H,  bar_index + 4)
+        label.set_x(lblO5L,  bar_index + 4)
+    if not na(lblO15H)
+        label.set_x(lblO15H, bar_index + 4)
+        label.set_x(lblO15L, bar_index + 4)
+
+// Keep all labels at right edge every bar
+if not na(lblPDH)
+    label.set_x(lblPDH, bar_index + 4)
+    label.set_x(lblPDL, bar_index + 4)
+if not na(lblPMH)
+    label.set_x(lblPMH, bar_index + 4)
+    label.set_x(lblPML, bar_index + 4)
+
+// ══════════════════════════════════════════════════════
+// SECTION 2 — MTF TREND (EMA SLOPE)
+// ══════════════════════════════════════════════════════
+// Trend = bullish when 9 EMA is sloping up (current bar EMA > prior bar EMA).
+// lookahead_off: on historical bars uses confirmed close values; on the live bar
+// shows in-progress values that may change before the HTF bar closes (disclosed above).
+
+[e9_5m,  e9_5m_p]  = request.security(syminfo.tickerid, "5",  [ta.ema(close, i_emaFast), ta.ema(close, i_emaFast)[1]], lookahead=barmerge.lookahead_off)
+[e9_15m, e9_15m_p] = request.security(syminfo.tickerid, "15", [ta.ema(close, i_emaFast), ta.ema(close, i_emaFast)[1]], lookahead=barmerge.lookahead_off)
+[e9_D,   e9_D_p]   = request.security(syminfo.tickerid, "D",  [ta.ema(close, i_emaFast), ta.ema(close, i_emaFast)[1]], lookahead=barmerge.lookahead_off)
+
+trend5m  = e9_5m  > e9_5m_p  ? 1 : -1
+trend15m = e9_15m > e9_15m_p ? 1 : -1
+trendD   = e9_D   > e9_D_p   ? 1 : -1
+
+allBull = trend5m == 1 and trend15m == 1 and trendD == 1
+allBear = trend5m == -1 and trend15m == -1 and trendD == -1
+
+// ── Trend Table ──────────────────────────────────────
+var table tTrend = na
+
+if i_showTable and barstate.islast
+    if na(tTrend)
+        tTrend := table.new(position.top_right, 2, 4,
+             bgcolor      = color.new(color.black, 65),
+             border_color = color.new(color.gray, 50), border_width  = 1,
+             frame_color  = color.new(color.gray, 50), frame_width   = 1)
+
+    // Header
+    table.cell(tTrend, 0, 0, "TF",    text_color=color.new(color.silver, 20), text_size=size.tiny, bgcolor=color.new(#1A1A2E, 20))
+    table.cell(tTrend, 1, 0, "Trend", text_color=color.new(color.silver, 20), text_size=size.tiny, bgcolor=color.new(#1A1A2E, 20))
+
+    _tCell(int tr) =>
+        _bg  = tr == 1 ? color.new(#1B5E20, 30) : color.new(#B71C1C, 30)
+        _txt = tr == 1 ? "▲ Bull" : "▼ Bear"
+        _tc  = tr == 1 ? color.new(#69F0AE, 0) : color.new(#FF5252, 0)
+        [_bg, _txt, _tc]
+
+    [bg5, t5, tc5]    = _tCell(trend5m)
+    [bg15, t15, tc15] = _tCell(trend15m)
+    [bgD, tD, tcD]    = _tCell(trendD)
+
+    table.cell(tTrend, 0, 1, "5m",  text_color=color.new(color.silver, 0), text_size=size.tiny, bgcolor=color.new(color.black, 65))
+    table.cell(tTrend, 1, 1, t5,   text_color=tc5,  text_size=size.tiny, bgcolor=bg5)
+    table.cell(tTrend, 0, 2, "15m", text_color=color.new(color.silver, 0), text_size=size.tiny, bgcolor=color.new(color.black, 65))
+    table.cell(tTrend, 1, 2, t15,  text_color=tc15, text_size=size.tiny, bgcolor=bg15)
+    table.cell(tTrend, 0, 3, "D",   text_color=color.new(color.silver, 0), text_size=size.tiny, bgcolor=color.new(color.black, 65))
+    table.cell(tTrend, 1, 3, tD,   text_color=tcD,  text_size=size.tiny, bgcolor=bgD)
+
+// ══════════════════════════════════════════════════════
+// SECTION 4 — PIVOT ZONE DETECTION
+// ══════════════════════════════════════════════════════
+// Daily H and L values accumulate in rolling arrays (one entry per completed trading day).
+// On each new day, prior day's H/L are appended and the array is trimmed to lookback.
+// A sort-and-cluster algorithm groups nearby levels; clusters with i_pvtMinTouches or more
+// touches are drawn as semi-transparent shaded boxes extending across the full chart.
+//
+// REPAINTING: Zone boundaries are stable on historical bars. The current day's contribution
+// (today's daily H/L) shifts until the 4 PM daily close. Zones redraw once per day.
+
+var float[] _dHighs = array.new_float(0)
+var float[] _dLows  = array.new_float(0)
+
+if newDay and not na(pdHigh)
+    array.push(_dHighs, pdHigh)
+    array.push(_dLows,  pdLow)
+    if array.size(_dHighs) > i_pvtLookback
+        array.shift(_dHighs)
+        array.shift(_dLows)
+
+// Clustering function: sort input array, walk through grouping values within tol%
+// Returns parallel arrays: zone lows, zone highs, touch counts
+f_cluster(float[] pts, float tol) =>
+    float[] zL = array.new_float(0)
+    float[] zH = array.new_float(0)
+    int[]   zC = array.new_int(0)
+
+    if array.size(pts) >= 2
+        float[] s = array.copy(pts)
+        array.sort(s, order.ascending)
+
+        float lo  = array.get(s, 0)
+        float hi  = lo
+        int   cnt = 1
+
+        for i = 1 to array.size(s) - 1
+            float v   = array.get(s, i)
+            float mid = (lo + hi) * 0.5
+            // Expand cluster if v is within tolerance of current cluster midpoint
+            if math.abs(v - mid) / mid <= tol
+                hi  := math.max(hi, v)
+                lo  := math.min(lo, v)
+                cnt += 1
+            else
+                array.push(zL, lo)
+                array.push(zH, hi)
+                array.push(zC, cnt)
+                lo  := v
+                hi  := v
+                cnt := 1
+
+        array.push(zL, lo)     // flush last cluster
+        array.push(zH, hi)
+        array.push(zC, cnt)
+
+    [zL, zH, zC]
+
+// Zone box storage — rebuilt once per day
+var box[]   zBoxes  = array.new<box>(0)
+var float[] zMids   = array.new_float(0)   // zone midpoints for proximity check
+
+if newDay and i_showZones and array.size(_dHighs) >= i_pvtMinTouches
+    for b in zBoxes
+        box.delete(b)
+    array.clear(zBoxes)
+    array.clear(zMids)
+
+    // Combine highs and lows into one pool of touch levels
+    float[] allTouches = array.copy(_dHighs)
+    for i = 0 to array.size(_dLows) - 1
+        array.push(allTouches, array.get(_dLows, i))
+
+    _tol = i_zoneTol / 100
+    [zL, zH, zC] = f_cluster(allTouches, _tol)
+
+    _futureTime = timestamp(2099, 12, 31, 0, 0)
+    _pastTime   = chart.left_visible_bar_time
+
+    for i = 0 to array.size(zC) - 1
+        if array.get(zC, i) >= i_pvtMinTouches
+            float zh = array.get(zH, i)
+            float zl = array.get(zL, i)
+            // Minimum visible height: 0.1% of price if the range is very tight
+            float minH = close * 0.001
+            if zh - zl < minH
+                float pad = (minH - (zh - zl)) * 0.5
+                zh += pad
+                zl -= pad
+            b = box.new(
+                 left         = _pastTime,
+                 top          = zh,
+                 right        = _futureTime,
+                 bottom       = zl,
+                 xloc         = xloc.bar_time,
+                 bgcolor      = color.new(#5C6BC0, 87),
+                 border_color = color.new(#5C6BC0, 65),
+                 border_width = 1,
+                 border_style = line.style_dashed)
+            array.push(zBoxes, b)
+            array.push(zMids, (zh + zl) * 0.5)
+
+// Helper: is price within i_zoneProx% of any active zone?
+f_nearZone(float lvl) =>
+    bool near = false
+    float prox = i_zoneProx / 100
+    for i = 0 to array.size(zBoxes) - 1
+        b   = array.get(zBoxes, i)
+        ztop = box.get_top(b)
+        zbot = box.get_bottom(b)
+        zmid = (ztop + zbot) * 0.5
+        if (lvl >= zbot and lvl <= ztop) or math.abs(lvl - zmid) / zmid <= prox
+            near := true
+            break
+    near
+
+// ══════════════════════════════════════════════════════
+// SECTION 5 — SIGNAL LOGIC
+// ══════════════════════════════════════════════════════
+
+aboveVwap = close > vwapVal
+belowVwap = close < vwapVal
+emasBull  = ema9 > ema20
+emasBear  = ema9 < ema20
+
+// All base conditions (before ORB and session filter)
+callBase = allBull and aboveVwap and emasBull and orbBullMet and inSigSess
+putBase  = allBear and belowVwap and emasBear and orbBearMet and inSigSess
+
+// Fire signal on this bar only if not already consumed in this ORB cycle
+callSignal = callBase and not callConsumed
+putSignal  = putBase  and not putConsumed
+
+// Mark signal consumed so it doesn't repeat until ORB level resets
+if callSignal
+    callConsumed := true
+if putSignal
+    putConsumed  := true
+
+// Grade: A = all conditions + near a pivot zone. B = all conditions only.
+callA = callSignal and f_nearZone(close)
+callB = callSignal and not callA
+putA  = putSignal  and f_nearZone(close)
+putB  = putSignal  and not putA
+
+// ── Signal Plots ─────────────────────────────────────
+// B-grade: standard arrow
+plotshape(callB, "CALL B-Grade", shape.triangleup,   location.belowbar, color.new(#00E676, 0),  size=size.normal)
+plotshape(putB,  "PUT B-Grade",  shape.triangledown, location.abovebar, color.new(#FF1744, 0),  size=size.normal)
+
+// A-grade: large arrow + diamond
+plotshape(callA, "CALL A-Grade Arrow",   shape.triangleup,   location.belowbar, color.new(#00FF00, 0), size=size.large)
+plotshape(callA, "CALL A-Grade Diamond", shape.diamond,      location.belowbar, color.new(#00FF00, 0), size=size.small, offset=-1)
+plotshape(putA,  "PUT A-Grade Arrow",    shape.triangledown, location.abovebar, color.new(#FF0000, 0), size=size.large)
+plotshape(putA,  "PUT A-Grade Diamond",  shape.diamond,      location.abovebar, color.new(#FF0000, 0), size=size.small, offset=-1)
+
+// ══════════════════════════════════════════════════════
+// SECTION 6 — EXIT GUIDANCE
+// ══════════════════════════════════════════════════════
+// T1 line and Exit Warning appear only after a signal fires. They are cleared on new day.
+// T1 = +0.5% (default) move on the underlying from signal close price.
+
+var line  lnT1Call = na, lnT1Put = na
+var label lblT1Call = na, lblT1Put = na
+var float t1CallLevel = na
+var float t1PutLevel  = na
+var bool  inCallTrade = false
+var bool  inPutTrade  = false
+
+if newDay
+    line.delete(lnT1Call),   line.delete(lnT1Put)
+    label.delete(lblT1Call), label.delete(lblT1Put)
+    lnT1Call := na, lnT1Put := na
+    lblT1Call := na, lblT1Put := na
+    t1CallLevel := na, t1PutLevel := na
+    inCallTrade := false, inPutTrade := false
+
+if i_showExits
+    // Draw T1 line on signal bar
+    if callSignal
+        line.delete(lnT1Call)
+        label.delete(lblT1Call)
+        t1CallLevel := close * (1 + i_t1Pct / 100)
+        lnT1Call    := line.new(bar_index, t1CallLevel, bar_index + 1, t1CallLevel,
+             extend=extend.right, color=color.new(color.white, 40),
+             style=line.style_dashed, width=1)
+        lblT1Call   := label.new(bar_index + 4, t1CallLevel,
+             "T1 +" + str.tostring(i_t1Pct, "#.##") + "%",
+             style=label.style_none, textcolor=color.new(color.white, 30),
+             size=size.tiny, color=color.new(color.white, 100))
+        inCallTrade := true
+
+    if putSignal
+        line.delete(lnT1Put)
+        label.delete(lblT1Put)
+        t1PutLevel := close * (1 - i_t1Pct / 100)
+        lnT1Put    := line.new(bar_index, t1PutLevel, bar_index + 1, t1PutLevel,
+             extend=extend.right, color=color.new(color.white, 40),
+             style=line.style_dashed, width=1)
+        lblT1Put   := label.new(bar_index + 4, t1PutLevel,
+             "T1 -" + str.tostring(i_t1Pct, "#.##") + "%",
+             style=label.style_none, textcolor=color.new(color.white, 30),
+             size=size.tiny, color=color.new(color.white, 100))
+        inPutTrade := true
+
+    // Keep T1 labels at right edge
+    if not na(lblT1Call)
+        label.set_x(lblT1Call, bar_index + 4)
+    if not na(lblT1Put)
+        label.set_x(lblT1Put,  bar_index + 4)
+
+    // Exit Warning: EMA cross against trade direction
+    exitWarnCall = inCallTrade and ta.crossunder(ema9, ema20)
+    exitWarnPut  = inPutTrade  and ta.crossover (ema9, ema20)
+
+    if exitWarnCall
+        label.new(bar_index, high, "Exit Warning",
+             style=label.style_label_down, textcolor=color.white,
+             color=color.new(color.orange, 20), size=size.tiny)
+        inCallTrade := false
+
+    if exitWarnPut
+        label.new(bar_index, low, "Exit Warning",
+             style=label.style_label_up, textcolor=color.white,
+             color=color.new(color.orange, 20), size=size.tiny)
+        inPutTrade := false
+
+// ══════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════
+// Create four alert conditions in TradingView Alerts panel (clock icon).
+// Use "Once Per Bar Close" for all four to avoid intra-bar fires.
+
+alertcondition(callA, "CALL — A-Grade Signal",
+     "A-Grade CALL: All trends bull + ORB break + VWAP above + near pivot zone. Check options chain.")
+alertcondition(callB, "CALL — B-Grade Signal",
+     "B-Grade CALL: All trends bull + ORB break + VWAP above. No major zone nearby.")
+alertcondition(putA,  "PUT — A-Grade Signal",
+     "A-Grade PUT: All trends bear + ORB break + VWAP below + near pivot zone. Check options chain.")
+alertcondition(putB,  "PUT — B-Grade Signal",
+     "B-Grade PUT: All trends bear + ORB break + VWAP below. No major zone nearby.")

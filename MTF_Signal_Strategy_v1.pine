@@ -1,0 +1,451 @@
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║  MTF SIGNAL STRATEGY v1.0                                            ║
+// ║  Same logic as MTF_Signal_Indicator_v1.pine — Strategy Tester build  ║
+// ║                                                                      ║
+// ║  BACKTEST RELIABILITY NOTES:                                         ║
+// ║  • HTF trend conditions (5m/15m/D) are built with lookahead_off.    ║
+// ║    On historical bars this is accurate. The live bar still shows     ║
+// ║    in-progress HTF values — inherent to MTF analysis, not a bug.    ║
+// ║  • Signals fire at 1m bar CLOSE — no look-ahead on 1m chart.        ║
+// ║  • Entries execute at the OPEN of the next bar after the signal      ║
+// ║    (commission_value + slippage = realistic friction).               ║
+// ║  • Pivot zones are informational in the strategy; they affect        ║
+// ║    A-grade vs B-grade labeling only, not entry/exit logic.          ║
+// ║  • Stop and T1 exits execute on the bar AFTER the condition is met.  ║
+// ║  • Set commission and slippage in Strategy Settings → Properties.   ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+//@version=5
+strategy("MTF Signal Strategy [v1.0]",
+     overlay            = true,
+     max_lines_count    = 500,
+     max_labels_count   = 500,
+     max_boxes_count    = 200,
+     max_bars_back      = 5000,
+     initial_capital    = 100000,
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 10,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.05,      // 0.05% per side — adjust to match your broker
+     slippage           = 2,         // 2 ticks slippage — adjust per instrument
+     calc_on_every_tick = false)     // bar-close accuracy only
+
+// ══════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════
+
+i_emaFast       = input.int   (9,    "EMA Fast Length",                   minval=1,   maxval=50,  group="EMAs")
+i_emaSlow       = input.int   (20,   "EMA Slow Length",                   minval=1,   maxval=200, group="EMAs")
+
+i_orbEnabled    = input.bool  (true, "Require ORB Break for Signal",                              group="Opening Range")
+
+i_pvtLookback   = input.int   (90,   "Lookback (trading days)",           minval=10,  maxval=252, group="Pivot Zones")
+i_pvtMinTouches = input.int   (3,    "Minimum Touches for Zone",          minval=2,   maxval=10,  group="Pivot Zones")
+i_zoneTol       = input.float (0.5,  "Zone Cluster Tolerance (%)",        minval=0.1, maxval=3.0, step=0.05, group="Pivot Zones")
+
+i_zoneProx      = input.float (0.3,  "A-Grade Zone Proximity (%)",        minval=0.05, maxval=2.0, step=0.05, group="Signals")
+// T1 target: % move on underlying. Default 0.5% (≈ 25-50% options gain on ATM delta ~0.5).
+i_t1Pct         = input.float (0.5,  "T1 Target (% underlying move)",     minval=0.1, maxval=10.0, step=0.05, group="Signals")
+i_slPct         = input.float (1.5,  "Stop Loss (% underlying move)",     minval=0.1, maxval=10.0, step=0.05, group="Signals")
+
+i_pmOverride    = input.symbol("",   "Pre-market Source Override (blank = current symbol)", group="Key Levels")
+
+i_showORB       = input.bool  (true, "Show ORB Lines",           group="Display Toggles")
+i_showPrevDay   = input.bool  (true, "Show Previous Day Levels", group="Display Toggles")
+i_showPreMkt    = input.bool  (true, "Show Pre-Market Levels",   group="Display Toggles")
+i_showZones     = input.bool  (true, "Show Pivot Zones",         group="Display Toggles")
+i_showTable     = input.bool  (true, "Show Trend Table",         group="Display Toggles")
+
+i_sessFilter    = input.bool  (true,        "Limit Signals to Session Window", group="Session")
+i_sessTime      = input.session("0930-1100","Signal Window (exchange timezone)", group="Session")
+
+// ══════════════════════════════════════════════════════
+// TIME / SESSION HELPERS
+// ══════════════════════════════════════════════════════
+
+TZ          = "America/New_York"
+isRTH       = not na(time("1", "0930-1600", TZ))
+isORB5win   = not na(time("1", "0930-0935", TZ))
+isORB15win  = not na(time("1", "0930-0945", TZ))
+inSigSess   = i_sessFilter ? not na(time("1", i_sessTime, TZ)) : isRTH
+newDay      = ta.change(time("D")) != 0
+
+// ══════════════════════════════════════════════════════
+// EMA + VWAP
+// ══════════════════════════════════════════════════════
+
+ema9    = ta.ema(close, i_emaFast)
+ema20   = ta.ema(close, i_emaSlow)
+vwapVal = ta.vwap(hlc3)
+
+plot(ema9,    "EMA Fast", color=color.new(color.lime,   0), linewidth=1)
+plot(ema20,   "EMA Slow", color=color.new(color.orange, 0), linewidth=1)
+plot(vwapVal, "VWAP",     color=color.new(color.purple, 0), linewidth=2)
+
+// ══════════════════════════════════════════════════════
+// PREVIOUS DAY H/L
+// ══════════════════════════════════════════════════════
+
+pdHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+// ══════════════════════════════════════════════════════
+// PRE-MARKET H/L
+// ══════════════════════════════════════════════════════
+
+f_pmHL() =>
+    var float _h    = na
+    var float _l    = na
+    var int   _date = na
+    _ispm = not na(time("1", "0400-0930", TZ))
+    _d    = dayofmonth(time, TZ)
+    if na(_date) or _d != _date
+        _date := _d
+        _h    := na
+        _l    := na
+    if _ispm
+        _h := na(_h) ? high : math.max(_h, high)
+        _l := na(_l) ? low  : math.min(_l, low)
+    [_h, _l]
+
+_pmSym          = i_pmOverride != "" ? i_pmOverride : syminfo.tickerid
+[pmHigh, pmLow] = request.security(_pmSym, "1", f_pmHL(),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// ══════════════════════════════════════════════════════
+// ORB
+// ══════════════════════════════════════════════════════
+
+var float orb5H  = na, orb5L  = na
+var float orb15H = na, orb15L = na
+var bool  orb5Done = false, orb15Done = false
+var bool  orb5AbvActive = false, orb5BlwActive = false
+var bool  orb15AbvActive = false, orb15BlwActive = false
+var bool  callConsumed = false, putConsumed = false
+
+if newDay
+    orb5H  := na, orb5L  := na
+    orb15H := na, orb15L := na
+    orb5Done := false, orb15Done := false
+    orb5AbvActive  := false, orb5BlwActive  := false
+    orb15AbvActive := false, orb15BlwActive := false
+    callConsumed := false, putConsumed := false
+
+if isORB5win
+    orb5H := na(orb5H) ? high : math.max(orb5H, high)
+    orb5L := na(orb5L) ? low  : math.min(orb5L, low)
+if isORB15win
+    orb15H := na(orb15H) ? high : math.max(orb15H, high)
+    orb15L := na(orb15L) ? low  : math.min(orb15L, low)
+if not isORB5win  and not orb5Done  and not na(orb5H)
+    orb5Done := true
+if not isORB15win and not orb15Done and not na(orb15H)
+    orb15Done := true
+
+if orb5Done and not na(orb5H)
+    if close > orb5H
+        orb5AbvActive := true
+    if close <= orb5H
+        orb5AbvActive := false
+        callConsumed  := false
+    if close < orb5L
+        orb5BlwActive := true
+    if close >= orb5L
+        orb5BlwActive := false
+        putConsumed   := false
+
+if orb15Done and not na(orb15H)
+    if close > orb15H
+        orb15AbvActive := true
+    if close <= orb15H
+        orb15AbvActive := false
+        callConsumed   := false
+    if close < orb15L
+        orb15BlwActive := true
+    if close >= orb15L
+        orb15BlwActive := false
+        putConsumed    := false
+
+orbBullMet = not i_orbEnabled or (orb5AbvActive or orb15AbvActive)
+orbBearMet = not i_orbEnabled or (orb5BlwActive or orb15BlwActive)
+
+// ══════════════════════════════════════════════════════
+// KEY LEVEL LINES (visual only — same as indicator)
+// ══════════════════════════════════════════════════════
+
+var line  lnPDH = na, lnPDL = na, lnPMH = na, lnPML = na
+var line  lnO5H = na, lnO5L = na, lnO15H = na, lnO15L = na
+var label lblPDH = na, lblPDL = na, lblPMH = na, lblPML = na
+var label lblO5H = na, lblO5L = na, lblO15H = na, lblO15L = na
+
+_mkLn(float lvl, color col)  => line.new(bar_index, lvl, bar_index + 1, lvl, extend=extend.right, color=col, style=line.style_dashed, width=1)
+_mkLb(float lvl, string txt, color col) => label.new(bar_index + 4, lvl, txt, style=label.style_none, textcolor=col, size=size.tiny, color=color.new(color.white, 100))
+
+if newDay and isRTH
+    line.delete(lnPDH),  line.delete(lnPDL),  label.delete(lblPDH), label.delete(lblPDL)
+    line.delete(lnPMH),  line.delete(lnPML),  label.delete(lblPMH), label.delete(lblPML)
+    lnPDH := na, lnPDL := na, lnPMH := na, lnPML := na
+    lblPDH := na, lblPDL := na, lblPMH := na, lblPML := na
+    _cPD = color.new(color.gray, 30)
+    _cPM = color.new(#4FC3F7, 30)
+    if i_showPrevDay and not na(pdHigh)
+        lnPDH := _mkLn(pdHigh, _cPD), lnPDL := _mkLn(pdLow, _cPD)
+        lblPDH := _mkLb(pdHigh, "PDH", _cPD), lblPDL := _mkLb(pdLow, "PDL", _cPD)
+    if i_showPreMkt and not na(pmHigh)
+        lnPMH := _mkLn(pmHigh, _cPM), lnPML := _mkLn(pmLow, _cPM)
+        lblPMH := _mkLb(pmHigh, "PMH", _cPM), lblPML := _mkLb(pmLow, "PML", _cPM)
+
+_cO5 = color.new(color.orange, 25)
+_cO15 = color.new(#FFD700, 25)
+if i_showORB
+    if orb5Done  and na(lnO5H)
+        lnO5H  := _mkLn(orb5H,  _cO5),  lnO5L  := _mkLn(orb5L,  _cO5)
+        lblO5H := _mkLb(orb5H,  "ORB5 H", _cO5), lblO5L := _mkLb(orb5L, "ORB5 L", _cO5)
+    if orb15Done and na(lnO15H)
+        lnO15H := _mkLn(orb15H, _cO15), lnO15L := _mkLn(orb15L, _cO15)
+        lblO15H := _mkLb(orb15H, "ORB15 H", _cO15), lblO15L := _mkLb(orb15L, "ORB15 L", _cO15)
+    if not na(lblO5H),  label.set_x(lblO5H,  bar_index + 4), label.set_x(lblO5L,  bar_index + 4)
+    if not na(lblO15H), label.set_x(lblO15H, bar_index + 4), label.set_x(lblO15L, bar_index + 4)
+if not na(lblPDH), label.set_x(lblPDH, bar_index + 4), label.set_x(lblPDL, bar_index + 4)
+if not na(lblPMH), label.set_x(lblPMH, bar_index + 4), label.set_x(lblPML, bar_index + 4)
+
+// ══════════════════════════════════════════════════════
+// MTF TREND
+// ══════════════════════════════════════════════════════
+
+[e9_5m,  e9_5m_p]  = request.security(syminfo.tickerid, "5",  [ta.ema(close, i_emaFast), ta.ema(close, i_emaFast)[1]], lookahead=barmerge.lookahead_off)
+[e9_15m, e9_15m_p] = request.security(syminfo.tickerid, "15", [ta.ema(close, i_emaFast), ta.ema(close, i_emaFast)[1]], lookahead=barmerge.lookahead_off)
+[e9_D,   e9_D_p]   = request.security(syminfo.tickerid, "D",  [ta.ema(close, i_emaFast), ta.ema(close, i_emaFast)[1]], lookahead=barmerge.lookahead_off)
+
+trend5m  = e9_5m  > e9_5m_p  ? 1 : -1
+trend15m = e9_15m > e9_15m_p ? 1 : -1
+trendD   = e9_D   > e9_D_p   ? 1 : -1
+
+allBull = trend5m == 1 and trend15m == 1 and trendD == 1
+allBear = trend5m == -1 and trend15m == -1 and trendD == -1
+
+// Trend Table
+var table tTrend = na
+if i_showTable and barstate.islast
+    if na(tTrend)
+        tTrend := table.new(position.top_right, 2, 4,
+             bgcolor=color.new(color.black, 65),
+             border_color=color.new(color.gray, 50), border_width=1,
+             frame_color=color.new(color.gray, 50), frame_width=1)
+    _tC(int tr) =>
+        [tr == 1 ? color.new(#1B5E20, 30) : color.new(#B71C1C, 30),
+         tr == 1 ? "▲ Bull" : "▼ Bear",
+         tr == 1 ? color.new(#69F0AE, 0) : color.new(#FF5252, 0)]
+    [bg5, t5, tc5]    = _tC(trend5m)
+    [bg15, t15, tc15] = _tC(trend15m)
+    [bgD, tD, tcD]    = _tC(trendD)
+    table.cell(tTrend, 0, 0, "TF",   text_color=color.new(color.silver, 20), text_size=size.tiny, bgcolor=color.new(#1A1A2E, 20))
+    table.cell(tTrend, 1, 0, "Trend",text_color=color.new(color.silver, 20), text_size=size.tiny, bgcolor=color.new(#1A1A2E, 20))
+    table.cell(tTrend, 0, 1, "5m",   text_color=color.new(color.silver, 0),  text_size=size.tiny, bgcolor=color.new(color.black, 65))
+    table.cell(tTrend, 1, 1, t5,     text_color=tc5,  text_size=size.tiny, bgcolor=bg5)
+    table.cell(tTrend, 0, 2, "15m",  text_color=color.new(color.silver, 0),  text_size=size.tiny, bgcolor=color.new(color.black, 65))
+    table.cell(tTrend, 1, 2, t15,    text_color=tc15, text_size=size.tiny, bgcolor=bg15)
+    table.cell(tTrend, 0, 3, "D",    text_color=color.new(color.silver, 0),  text_size=size.tiny, bgcolor=color.new(color.black, 65))
+    table.cell(tTrend, 1, 3, tD,     text_color=tcD,  text_size=size.tiny, bgcolor=bgD)
+
+// ══════════════════════════════════════════════════════
+// PIVOT ZONES
+// ══════════════════════════════════════════════════════
+
+var float[] _dHighs = array.new_float(0)
+var float[] _dLows  = array.new_float(0)
+
+if newDay and not na(pdHigh)
+    array.push(_dHighs, pdHigh)
+    array.push(_dLows,  pdLow)
+    if array.size(_dHighs) > i_pvtLookback
+        array.shift(_dHighs)
+        array.shift(_dLows)
+
+f_cluster(float[] pts, float tol) =>
+    float[] zL = array.new_float(0)
+    float[] zH = array.new_float(0)
+    int[]   zC = array.new_int(0)
+    if array.size(pts) >= 2
+        float[] s = array.copy(pts)
+        array.sort(s, order.ascending)
+        float lo = array.get(s, 0), float hi = lo, int cnt = 1
+        for i = 1 to array.size(s) - 1
+            float v = array.get(s, i)
+            float mid = (lo + hi) * 0.5
+            if math.abs(v - mid) / mid <= tol
+                hi := math.max(hi, v), lo := math.min(lo, v), cnt += 1
+            else
+                array.push(zL, lo), array.push(zH, hi), array.push(zC, cnt)
+                lo := v, hi := v, cnt := 1
+        array.push(zL, lo), array.push(zH, hi), array.push(zC, cnt)
+    [zL, zH, zC]
+
+var box[]   zBoxes = array.new<box>(0)
+var float[] zMids  = array.new_float(0)
+
+if newDay and i_showZones and array.size(_dHighs) >= i_pvtMinTouches
+    for b in zBoxes
+        box.delete(b)
+    array.clear(zBoxes)
+    array.clear(zMids)
+    float[] allTouches = array.copy(_dHighs)
+    for i = 0 to array.size(_dLows) - 1
+        array.push(allTouches, array.get(_dLows, i))
+    [zL, zH, zC] = f_cluster(allTouches, i_zoneTol / 100)
+    _ft = timestamp(2099, 12, 31, 0, 0)
+    _pt = chart.left_visible_bar_time
+    for i = 0 to array.size(zC) - 1
+        if array.get(zC, i) >= i_pvtMinTouches
+            float zh = array.get(zH, i), float zl = array.get(zL, i)
+            float minH = close * 0.001
+            if zh - zl < minH
+                float pad = (minH - (zh - zl)) * 0.5
+                zh += pad, zl -= pad
+            b = box.new(_pt, zh, _ft, zl, xloc=xloc.bar_time,
+                 bgcolor=color.new(#5C6BC0, 87),
+                 border_color=color.new(#5C6BC0, 65),
+                 border_width=1, border_style=line.style_dashed)
+            array.push(zBoxes, b)
+            array.push(zMids, (zh + zl) * 0.5)
+
+f_nearZone(float lvl) =>
+    bool near = false
+    float prox = i_zoneProx / 100
+    for i = 0 to array.size(zBoxes) - 1
+        b = array.get(zBoxes, i)
+        ztop = box.get_top(b), zbot = box.get_bottom(b)
+        if (lvl >= zbot and lvl <= ztop) or math.abs(lvl - (ztop + zbot) * 0.5) / ((ztop + zbot) * 0.5) <= prox
+            near := true, break
+    near
+
+// ══════════════════════════════════════════════════════
+// SIGNAL LOGIC
+// ══════════════════════════════════════════════════════
+
+aboveVwap = close > vwapVal
+belowVwap = close < vwapVal
+emasBull  = ema9 > ema20
+emasBear  = ema9 < ema20
+
+callBase  = allBull and aboveVwap and emasBull and orbBullMet and inSigSess
+putBase   = allBear and belowVwap and emasBear and orbBearMet and inSigSess
+
+callSignal = callBase and not callConsumed
+putSignal  = putBase  and not putConsumed
+
+if callSignal
+    callConsumed := true
+if putSignal
+    putConsumed  := true
+
+callA = callSignal and f_nearZone(close)
+callB = callSignal and not callA
+putA  = putSignal  and f_nearZone(close)
+putB  = putSignal  and not putA
+
+// Signal markers on chart
+plotshape(callB, "CALL B", shape.triangleup,   location.belowbar, color.new(#00E676, 0), size=size.normal)
+plotshape(putB,  "PUT B",  shape.triangledown, location.abovebar, color.new(#FF1744, 0), size=size.normal)
+plotshape(callA, "CALL A Arrow",   shape.triangleup,   location.belowbar, color.new(#00FF00, 0), size=size.large)
+plotshape(callA, "CALL A Diamond", shape.diamond,      location.belowbar, color.new(#00FF00, 0), size=size.small, offset=-1)
+plotshape(putA,  "PUT A Arrow",    shape.triangledown, location.abovebar, color.new(#FF0000, 0), size=size.large)
+plotshape(putA,  "PUT A Diamond",  shape.diamond,      location.abovebar, color.new(#FF0000, 0), size=size.small, offset=-1)
+
+// ══════════════════════════════════════════════════════
+// STRATEGY ENTRIES + EXITS
+// ══════════════════════════════════════════════════════
+// Entry: market order at open of next bar after signal.
+// Exits (handled via strategy.exit):
+//   1. T1 target: +i_t1Pct% on underlying
+//   2. Stop loss: -i_slPct% on underlying
+//   3. EMA cross (secondary exit): managed via strategy.close
+
+// Entry signals
+if callSignal and strategy.position_size == 0
+    strategy.entry("CALL", strategy.long, comment=callA ? "A-CALL" : "B-CALL")
+
+if putSignal and strategy.position_size == 0
+    strategy.entry("PUT", strategy.short, comment=putA ? "A-PUT" : "B-PUT")
+
+// T1 and stop exit (percentage-based, scales with price)
+if strategy.position_size > 0    // Long (CALL)
+    strategy.exit("CALL Exit",
+         from_entry = "CALL",
+         profit     = close * (i_t1Pct / 100) / syminfo.mintick,    // T1 in ticks
+         loss       = close * (i_slPct / 100) / syminfo.mintick,     // SL in ticks
+         comment_profit = "T1 Hit",
+         comment_loss   = "SL Hit")
+
+if strategy.position_size < 0    // Short (PUT)
+    strategy.exit("PUT Exit",
+         from_entry = "PUT",
+         profit     = close * (i_t1Pct / 100) / syminfo.mintick,
+         loss       = close * (i_slPct / 100) / syminfo.mintick,
+         comment_profit = "T1 Hit",
+         comment_loss   = "SL Hit")
+
+// EMA cross exit — secondary exit if T1 not yet hit
+emaCrossAgainstLong  = strategy.position_size > 0 and ta.crossunder(ema9, ema20)
+emaCrossAgainstShort = strategy.position_size < 0 and ta.crossover (ema9, ema20)
+
+if emaCrossAgainstLong
+    strategy.close("CALL", comment="EMA Cross Exit")
+if emaCrossAgainstShort
+    strategy.close("PUT",  comment="EMA Cross Exit")
+
+// Close all at end of RTH session — no overnight holds
+if not isRTH and strategy.position_size != 0
+    strategy.close_all(comment="EOD Close")
+
+// ══════════════════════════════════════════════════════
+// EXIT GUIDANCE VISUALS (T1 line + Exit Warning)
+// ══════════════════════════════════════════════════════
+
+var line  lnT1 = na
+var label lblT1 = na
+var bool  inCallTrade = false, inPutTrade = false
+
+if newDay
+    line.delete(lnT1), label.delete(lblT1)
+    lnT1 := na, lblT1 := na
+    inCallTrade := false, inPutTrade := false
+
+if callSignal
+    line.delete(lnT1), label.delete(lblT1)
+    float t1Lvl = close * (1 + i_t1Pct / 100)
+    lnT1  := line.new(bar_index, t1Lvl, bar_index + 1, t1Lvl,
+         extend=extend.right, color=color.new(color.white, 40),
+         style=line.style_dashed, width=1)
+    lblT1 := label.new(bar_index + 4, t1Lvl,
+         "T1 +" + str.tostring(i_t1Pct, "#.##") + "%",
+         style=label.style_none, textcolor=color.new(color.white, 30),
+         size=size.tiny, color=color.new(color.white, 100))
+    inCallTrade := true, inPutTrade := false
+
+if putSignal
+    line.delete(lnT1), label.delete(lblT1)
+    float t1Lvl = close * (1 - i_t1Pct / 100)
+    lnT1  := line.new(bar_index, t1Lvl, bar_index + 1, t1Lvl,
+         extend=extend.right, color=color.new(color.white, 40),
+         style=line.style_dashed, width=1)
+    lblT1 := label.new(bar_index + 4, t1Lvl,
+         "T1 -" + str.tostring(i_t1Pct, "#.##") + "%",
+         style=label.style_none, textcolor=color.new(color.white, 30),
+         size=size.tiny, color=color.new(color.white, 100))
+    inPutTrade := true, inCallTrade := false
+
+if not na(lblT1)
+    label.set_x(lblT1, bar_index + 4)
+
+if inCallTrade and ta.crossunder(ema9, ema20)
+    label.new(bar_index, high, "Exit Warning",
+         style=label.style_label_down, textcolor=color.white,
+         color=color.new(color.orange, 20), size=size.tiny)
+    inCallTrade := false
+
+if inPutTrade and ta.crossover(ema9, ema20)
+    label.new(bar_index, low, "Exit Warning",
+         style=label.style_label_up, textcolor=color.white,
+         color=color.new(color.orange, 20), size=size.tiny)
+    inPutTrade := false
